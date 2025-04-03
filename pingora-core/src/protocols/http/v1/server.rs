@@ -65,6 +65,8 @@ pub struct HttpSession {
     response_written: Option<Box<ResponseHeader>>,
     /// The parsed request header
     request_header: Option<Box<RequestHeader>>,
+    /// The request body. from the client.
+    request_body: Option<Bytes>,
     /// An internal buffer that holds a copy of the request body up to a certain size
     retry_buffer: Option<FixedBuffer>,
     /// Whether this session is an upgraded session. This flag is calculated when sending the
@@ -103,6 +105,7 @@ impl HttpSession {
             update_resp_headers: true,
             response_written: None,
             request_header: None,
+            request_body: None,
             read_timeout: None,
             write_timeout: None,
             body_bytes_sent: 0,
@@ -344,6 +347,9 @@ impl HttpSession {
 
     /// Read the request body. `Ok(None)` when there is no (more) body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
+        if self.request_body.is_some() && self.is_body_done() {
+            return Ok(self.request_body.clone());
+        }
         let read = self.read_body().await?;
         Ok(read.map(|b| {
             let bytes = Bytes::copy_from_slice(self.get_body(&b));
@@ -351,6 +357,7 @@ impl HttpSession {
             if let Some(buffer) = self.retry_buffer.as_mut() {
                 buffer.write_to_buffer(&bytes);
             }
+            self.request_body = Some(bytes.clone());
             bytes
         }))
     }
@@ -779,6 +786,9 @@ impl HttpSession {
     /// the client body finishes (`Ok(None)` is returned), calling this function again will block
     /// forever, same as [`Self::idle()`].
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
+        if self.request_body.is_some() && self.is_body_done() {
+            return Ok(self.request_body.clone());
+        }
         if no_body_expected || self.is_body_done() {
             let read = self.idle().await?;
             if read == 0 {
