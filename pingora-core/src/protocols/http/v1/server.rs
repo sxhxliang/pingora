@@ -68,6 +68,7 @@ pub struct HttpSession {
     response_written: Option<Box<ResponseHeader>>,
     /// The parsed request header
     request_header: Option<Box<RequestHeader>>,
+    request_body: Option<Bytes>,
     /// An internal buffer that holds a copy of the request body up to a certain size
     retry_buffer: Option<FixedBuffer>,
     /// Whether this session is an upgraded session. This flag is calculated when sending the
@@ -106,6 +107,7 @@ impl HttpSession {
             update_resp_headers: true,
             response_written: None,
             request_header: None,
+            request_body: None,
             read_timeout: Some(Duration::from_secs(60)),
             write_timeout: None,
             total_drain_timeout: None,
@@ -382,6 +384,10 @@ impl HttpSession {
 
     /// Read the request body. `Ok(None)` when there is no (more) body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
+        log::debug!("server reading request body");
+        if self.request_body.is_some() && self.is_body_done() {
+            return Ok(self.request_body.clone());
+        }
         let read = self.read_body().await?;
         Ok(read.map(|b| {
             let bytes = Bytes::copy_from_slice(self.get_body(&b));
@@ -389,11 +395,13 @@ impl HttpSession {
             if let Some(buffer) = self.retry_buffer.as_mut() {
                 buffer.write_to_buffer(&bytes);
             }
+            self.request_body = Some(bytes.clone());
             bytes
         }))
     }
 
     async fn do_read_body(&mut self) -> Result<Option<BufRef>> {
+        log::debug!("Read the body into the internal buffer [do_read_body]");
         self.init_body_reader();
         self.body_reader
             .read_body(&mut self.underlying_stream)
@@ -402,6 +410,7 @@ impl HttpSession {
 
     /// Read the body into the internal buffer
     async fn read_body(&mut self) -> Result<Option<BufRef>> {
+        log::debug!("Read the body into the internal buffer");
         match self.read_timeout {
             Some(t) => match timeout(t, self.do_read_body()).await {
                 Ok(res) => res,
@@ -762,6 +771,7 @@ impl HttpSession {
     fn init_body_reader(&mut self) {
         if self.body_reader.need_init() {
             // reset retry buffer
+            log::debug!("init body reader");
             if let Some(buffer) = self.retry_buffer.as_mut() {
                 buffer.clear();
             }
@@ -769,16 +779,22 @@ impl HttpSession {
             /* follow https://tools.ietf.org/html/rfc7230#section-3.3.3 */
             let preread_body = self.preread_body.as_ref().unwrap().get(&self.buf[..]);
 
+            log::debug!("init body reader-----preread_body");
             if self.req_header().version == Version::HTTP_11 && self.is_upgrade_req() {
                 self.body_reader.init_http10(preread_body);
                 return;
             }
 
+            
             if self.is_chunked_encoding() {
+                log::debug!("init body reader-----chunked");
                 // if chunked encoding, content-length should be ignored
                 self.body_reader.init_chunked(preread_body);
             } else {
+               
                 let cl = self.get_content_length();
+                // log::debug!("init body reader-----content_length {:?}", cl);
+                // log::debug!("is_body_done", self.is_body_done() );
                 match cl {
                     Some(i) => {
                         self.body_reader.init_content_length(i, preread_body);
@@ -841,7 +857,14 @@ impl HttpSession {
     /// the client body finishes (`Ok(None)` is returned), calling this function again will block
     /// forever, same as [`Self::idle()`].
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
+
+        log::debug!("read_body_or_idle");
+        if self.request_body.is_some() && self.is_body_done() {
+            return Ok(self.request_body.clone());
+        }
+
         if no_body_expected || self.is_body_done() {
+            log::debug!(" if no_body_expected {:?} || self.is_body_done() {:?}", no_body_expected, self.is_body_done());
             let read = self.idle().await?;
             if read == 0 {
                 Error::e_explain(
@@ -856,6 +879,7 @@ impl HttpSession {
                 Error::e_explain(ConnectError, "Sent data after end of body")
             }
         } else {
+            log::debug!("self.read_body_bytes().await");
             self.read_body_bytes().await
         }
     }

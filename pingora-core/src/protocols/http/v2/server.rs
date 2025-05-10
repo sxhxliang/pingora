@@ -86,6 +86,7 @@ impl Future for Idle<'_> {
 pub struct HttpSession {
     request_header: RequestHeader,
     request_body_reader: RecvStream,
+    request_body: Option<Bytes>,
     send_response: SendResponse<Bytes>,
     send_response_body: Option<SendStream<Bytes>>,
     // Remember what has been written
@@ -134,6 +135,7 @@ impl HttpSession {
             HttpSession {
                 request_header: request_header.into(),
                 request_body_reader,
+                request_body: None,
                 send_response,
                 send_response_body: None,
                 response_written: None,
@@ -166,6 +168,10 @@ impl HttpSession {
     /// Read request body bytes. `None` when there is no more body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
         // TODO: timeout
+        log::debug!("Read request body bytes");
+        if self.request_body.is_some() && self.is_body_done() {
+            return Ok(self.request_body.clone());
+        }
         let data = self.request_body_reader.data().await.transpose().or_err(
             ErrorType::ReadError,
             "while reading downstream request body",
@@ -180,6 +186,7 @@ impl HttpSession {
                 .flow_control()
                 .release_capacity(data.len());
         }
+        self.request_body = data.clone();
         Ok(data)
     }
 
@@ -473,7 +480,11 @@ impl HttpSession {
     /// Similar to `read_body_bytes()` but will be pending after Ok(None) is returned,
     /// until the client closes the connection
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
+        if self.request_body.is_some() && self.is_body_done() {
+            return Ok(self.request_body.clone());
+        }
         if no_body_expected || self.is_body_done() {
+            log::debug!("No body expected, waiting for client to close");
             let reason = self.idle().await?;
             Error::e_explain(
                 ErrorType::H2Error,
