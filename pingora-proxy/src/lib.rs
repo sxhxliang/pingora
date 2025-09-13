@@ -49,12 +49,15 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time;
 
 use pingora_cache::NoCacheReason;
-use pingora_core::apps::{HttpServerApp, HttpServerOptions};
+use pingora_core::apps::{
+    HttpPersistentSettings, HttpServerApp, HttpServerOptions, ReusedHttpStream,
+};
 use pingora_core::connectors::{http::Connector, ConnectorOptions};
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
 use pingora_core::protocols::http::client::HttpSession as ClientSession;
 use pingora_core::protocols::http::v1::client::HttpSession as HttpSessionV1;
+use pingora_core::protocols::http::v2::server::H2Options;
 use pingora_core::protocols::http::HttpTask;
 use pingora_core::protocols::http::ServerSession as HttpSession;
 use pingora_core::protocols::http::SERVER_NAME;
@@ -73,9 +76,9 @@ mod proxy_h1;
 mod proxy_h2;
 mod proxy_purge;
 mod proxy_trait;
-mod subrequest;
+pub mod subrequest;
 
-use subrequest::Ctx as SubReqCtx;
+use subrequest::Ctx as SubrequestCtx;
 
 pub use proxy_cache::range_filter::{range_header_filter, RangeType};
 pub use proxy_purge::PurgeStatus;
@@ -93,6 +96,7 @@ pub struct HttpProxy<SV> {
     client_upstream: Connector,
     shutdown: Notify,
     pub server_options: Option<HttpServerOptions>,
+    pub h2_options: Option<H2Options>,
     pub downstream_modules: HttpModules,
     max_retries: usize,
 }
@@ -104,6 +108,7 @@ impl<SV> HttpProxy<SV> {
             client_upstream: Connector::new(Some(ConnectorOptions::from_server_conf(&conf))),
             shutdown: Notify::new(),
             server_options: None,
+            h2_options: None,
             downstream_modules: HttpModules::new(),
             max_retries: conf.max_retries,
         }
@@ -274,7 +279,7 @@ impl<SV> HttpProxy<SV> {
         ctx: &mut SV::CTX,
         reuse: bool,
         error: Option<&Error>,
-    ) -> Option<Stream>
+    ) -> Option<ReusedHttpStream>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
@@ -283,7 +288,14 @@ impl<SV> HttpProxy<SV> {
 
         if reuse {
             // TODO: log error
-            session.downstream_session.finish().await.ok().flatten()
+            let persistent_settings = HttpPersistentSettings::for_session(&session);
+            session
+                .downstream_session
+                .finish()
+                .await
+                .ok()
+                .flatten()
+                .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)))
         } else {
             None
         }
@@ -312,8 +324,12 @@ pub struct Session {
     pub upstream_compression: ResponseCompressionCtx,
     /// ignore downstream range (skip downstream range filters)
     pub ignore_downstream_range: bool,
-    // the context from parent request
-    pub subrequest_ctx: Option<Box<SubReqCtx>>,
+    /// Were the upstream request headers modified?
+    pub upstream_headers_mutated_for_cache: bool,
+    /// The context from parent request, if this is a subrequest.
+    pub subrequest_ctx: Option<Box<SubrequestCtx>>,
+    /// Handle to allow spawning subrequests, assigned by the `Subrequest` app logic.
+    pub subrequest_spawner: Option<SubrequestSpawner>,
     // Downstream filter modules
     pub downstream_modules_ctx: HttpModuleCtx,
 }
@@ -329,7 +345,9 @@ impl Session {
             // disable both upstream and downstream compression
             upstream_compression: ResponseCompressionCtx::new(0, false, false),
             ignore_downstream_range: false,
+            upstream_headers_mutated_for_cache: false,
             subrequest_ctx: None,
+            subrequest_spawner: None, // optionally set later on
             downstream_modules_ctx: downstream_modules.build_ctx(),
         }
     }
@@ -449,6 +467,17 @@ impl Session {
         }
         self.downstream_session.response_duplex_vec(tasks).await
     }
+
+    /// Mark the upstream headers as modified by caching. This should lead to range filters being
+    /// skipped when responding to the downstream.
+    pub fn mark_upstream_headers_mutated_for_cache(&mut self) {
+        self.upstream_headers_mutated_for_cache = true;
+    }
+
+    /// Check whether the upstream headers were marked as mutated during the request.
+    pub fn upstream_headers_mutated_for_cache(&self) -> bool {
+        self.upstream_headers_mutated_for_cache
+    }
 }
 
 impl AsRef<HttpSession> for Session {
@@ -496,7 +525,7 @@ impl<SV> HttpProxy<SV> {
         self: &Arc<Self>,
         mut session: Session,
         mut ctx: <SV as ProxyHttp>::CTX,
-    ) -> Option<Stream>
+    ) -> Option<ReusedHttpStream>
     where
         SV: ProxyHttp + Send + Sync + 'static,
         <SV as ProxyHttp>::CTX: Send + Sync,
@@ -509,6 +538,10 @@ impl<SV> HttpProxy<SV> {
             return self
                 .handle_error(session, &mut ctx, e, "Fail to early filter request:")
                 .await;
+        }
+
+        if self.inner.allow_spawning_subrequest(&session, &ctx) {
+            session.subrequest_spawner = Some(SubrequestSpawner::new(self.clone()));
         }
 
         let req = session.downstream_session.req_header_mut();
@@ -535,7 +568,14 @@ impl<SV> HttpProxy<SV> {
                     // TODO: log error
                     self.inner.logging(&mut session, None, &mut ctx).await;
                     self.cleanup_sub_req(&mut session);
-                    return session.downstream_session.finish().await.ok().flatten();
+                    let persistent_settings = HttpPersistentSettings::for_session(&session);
+                    return session
+                        .downstream_session
+                        .finish()
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)));
                 }
                 /* else continue */
             }
@@ -692,7 +732,7 @@ impl<SV> HttpProxy<SV> {
         ctx: &mut <SV as ProxyHttp>::CTX,
         e: Box<Error>,
         context: &str,
-    ) -> Option<Stream>
+    ) -> Option<ReusedHttpStream>
     where
         SV: ProxyHttp + Send + Sync + 'static,
         <SV as ProxyHttp>::CTX: Send + Sync,
@@ -710,7 +750,14 @@ impl<SV> HttpProxy<SV> {
         self.cleanup_sub_req(&mut session);
 
         if res.can_reuse_downstream {
-            session.downstream_session.finish().await.ok().flatten()
+            let persistent_settings = HttpPersistentSettings::for_session(&session);
+            session
+                .downstream_session
+                .finish()
+                .await
+                .ok()
+                .flatten()
+                .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)))
         } else {
             None
         }
@@ -727,11 +774,11 @@ error[E0391]: cycle detected when computing type of `proxy_cache::<impl at pingo
 
 */
 #[async_trait]
-trait Subrequest {
+pub trait Subrequest {
     async fn process_subrequest(
-        self: &Arc<Self>,
+        self: Arc<Self>,
         session: Box<HttpSession>,
-        sub_req_ctx: Box<SubReqCtx>,
+        sub_req_ctx: Box<SubrequestCtx>,
     );
 }
 
@@ -742,11 +789,12 @@ where
     <SV as ProxyHttp>::CTX: Send + Sync,
 {
     async fn process_subrequest(
-        self: &Arc<Self>,
+        self: Arc<Self>,
         session: Box<HttpSession>,
-        sub_req_ctx: Box<SubReqCtx>,
+        sub_req_ctx: Box<SubrequestCtx>,
     ) {
         debug!("starting subrequest");
+
         let mut session = match self.handle_new_request(session).await {
             Some(downstream_session) => Session::new(downstream_session, &self.downstream_modules),
             None => return, // bad request
@@ -764,6 +812,35 @@ where
     }
 }
 
+/// A handle to the underlying HTTP proxy app that allows spawning subrequests.
+pub struct SubrequestSpawner {
+    app: Arc<dyn Subrequest + Send + Sync>,
+}
+
+impl SubrequestSpawner {
+    /// Create a new [`SubrequestSpawner`].
+    pub fn new(app: Arc<dyn Subrequest + Send + Sync>) -> SubrequestSpawner {
+        SubrequestSpawner { app }
+    }
+
+    /// Spawn a background subrequest and return a join handle.
+    // TODO: allow configuring the subrequest session before use
+    pub fn spawn_background_subrequest(
+        &self,
+        session: &HttpSession,
+        ctx: SubrequestCtx,
+    ) -> tokio::task::JoinHandle<()> {
+        let new_app = self.app.clone(); // Clone the Arc
+        let subrequest = subrequest::create_dummy_session(session);
+        let sub_req_ctx = Box::new(ctx);
+        tokio::spawn(async move {
+            new_app
+                .process_subrequest(Box::new(subrequest), sub_req_ctx)
+                .await;
+        })
+    }
+}
+
 #[async_trait]
 impl<SV> HttpServerApp for HttpProxy<SV>
 where
@@ -773,23 +850,15 @@ where
     async fn process_new_http(
         self: &Arc<Self>,
         session: HttpSession,
-        shutdown: &ShutdownWatch,
-    ) -> Option<Stream> {
+        _shutdown: &ShutdownWatch,
+    ) -> Option<ReusedHttpStream> {
         let session = Box::new(session);
 
         // TODO: keepalive pool, use stack
-        let mut session = match self.handle_new_request(session).await {
+        let session = match self.handle_new_request(session).await {
             Some(downstream_session) => Session::new(downstream_session, &self.downstream_modules),
             None => return None, // bad request
         };
-
-        if *shutdown.borrow() {
-            // stop downstream from reusing if this service is shutting down soon
-            session.set_keepalive(None);
-        } else {
-            // default 60s
-            session.set_keepalive(Some(60));
-        }
 
         let ctx = self.inner.new_ctx();
         self.process_request(session, ctx).await
@@ -806,7 +875,9 @@ where
         self.server_options.as_ref()
     }
 
-    // TODO implement h2_options
+    fn h2_options(&self) -> Option<H2Options> {
+        self.h2_options.clone()
+    }
 }
 
 use pingora_core::services::listening::Service;

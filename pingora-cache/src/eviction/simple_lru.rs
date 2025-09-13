@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use lru::LruCache;
 use parking_lot::RwLock;
 use pingora_error::{BError, ErrorType::*, OrErr, Result};
+use rand::Rng;
 use serde::de::SeqAccess;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -43,6 +44,7 @@ struct Node {
 pub struct Manager {
     lru: RwLock<LruCache<u64, Node>>,
     limit: usize,
+    items_watermark: Option<usize>,
     used: AtomicUsize,
     items: AtomicUsize,
     evicted_size: AtomicUsize,
@@ -55,6 +57,20 @@ impl Manager {
         Manager {
             lru: RwLock::new(LruCache::unbounded()),
             limit,
+            items_watermark: None,
+            used: AtomicUsize::new(0),
+            items: AtomicUsize::new(0),
+            evicted_size: AtomicUsize::new(0),
+            evicted_items: AtomicUsize::new(0),
+        }
+    }
+
+    /// Create a new [Manager] with optional watermark in addition to size limit `limit`.
+    pub fn new_with_watermark(limit: usize, items_watermark: Option<usize>) -> Self {
+        Manager {
+            lru: RwLock::new(LruCache::unbounded()),
+            limit,
+            items_watermark,
             used: AtomicUsize::new(0),
             items: AtomicUsize::new(0),
             evicted_size: AtomicUsize::new(0),
@@ -95,13 +111,27 @@ impl Manager {
         self.used.fetch_add(delta, Ordering::Relaxed);
     }
 
-    // evict items until the used capacity is below the limit
+    #[inline]
+    fn over_limits(&self) -> bool {
+        self.used.load(Ordering::Relaxed) > self.limit
+            || self
+                .items_watermark
+                .is_some_and(|w| self.items.load(Ordering::Relaxed) > w)
+    }
+
+    // evict items until the used capacity is below the size limit and watermark count
     fn evict(&self) -> Vec<CompactCacheKey> {
-        if self.used.load(Ordering::Relaxed) <= self.limit {
+        if self.used.load(Ordering::Relaxed) <= self.limit
+            && self
+                .items_watermark
+                .map_or(true, |w| self.items.load(Ordering::Relaxed) <= w)
+        {
             return vec![];
         }
+
         let mut to_evict = Vec::with_capacity(1); // we will at least pop 1 item
-        while self.used.load(Ordering::Relaxed) > self.limit {
+
+        while self.over_limits() {
             if let Some((_, node)) = self.lru.write().pop_lru() {
                 self.used.fetch_sub(node.size, Ordering::Relaxed);
                 self.items.fetch_sub(1, Ordering::Relaxed);
@@ -242,12 +272,26 @@ impl EvictionManager for Manager {
             let dir_path = Path::new(&dir_str);
             std::fs::create_dir_all(dir_path)
                 .or_err_with(InternalError, || format!("fail to create {dir_str}"))?;
-            let file_path = dir_path.join(FILE_NAME);
-            let mut file = File::create(&file_path).or_err_with(InternalError, || {
-                format!("fail to create {}", file_path.display())
+
+            let final_file_path = dir_path.join(FILE_NAME);
+            // create a temporary filename using a randomized u32 hash to minimize the chance of multiple writers writing to the same tmp file
+            let random_suffix: u32 = rand::thread_rng().gen();
+            let temp_file_path = dir_path.join(format!("{}.{:08x}.tmp", FILE_NAME, random_suffix));
+            let mut file = File::create(&temp_file_path).or_err_with(InternalError, || {
+                format!("fail to create temporary file {}", temp_file_path.display())
             })?;
             file.write_all(&data).or_err_with(InternalError, || {
-                format!("fail to write to {}", file_path.display())
+                format!("fail to write to {}", temp_file_path.display())
+            })?;
+            file.flush().or_err_with(InternalError, || {
+                format!("fail to flush temp file {}", temp_file_path.display())
+            })?;
+            std::fs::rename(&temp_file_path, &final_file_path).or_err_with(InternalError, || {
+                format!(
+                    "fail to rename temporary file {} to {}",
+                    temp_file_path.display(),
+                    final_file_path.display()
+                )
             })
         })
         .await
@@ -460,5 +504,24 @@ mod test {
         let v = lru2.admit(key4, 2, until);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0], key2);
+    }
+
+    #[test]
+    fn test_watermark_eviction() {
+        const SIZE_LIMIT: usize = usize::MAX / 2;
+        let lru = Manager::new_with_watermark(SIZE_LIMIT, Some(4));
+        let until = SystemTime::now();
+
+        // admit 6 items of size 1
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            let key = CacheKey::new("", name, "1").to_compact();
+            let _ = lru.admit(key, 1, until);
+        }
+
+        // test items were evicted due to watermark
+        assert_eq!(lru.total_items(), 4);
+        assert_eq!(lru.evicted_items(), 2);
+        assert_eq!(lru.evicted_size(), 2);
+        assert!(lru.total_size() <= SIZE_LIMIT);
     }
 }

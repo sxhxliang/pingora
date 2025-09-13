@@ -20,6 +20,7 @@ use std::collections::HashMap;
 
 // There are probably off-the-shelf crates of this, DashMap?
 /// A hash table that shards to a constant number of tables to reduce lock contention
+#[derive(Debug)]
 pub struct ConcurrentHashTable<V, const N: usize> {
     tables: [RwLock<HashMap<u128, V>>; N],
 }
@@ -43,12 +44,30 @@ where
     }
 
     #[allow(dead_code)]
+    pub fn get_shard_at_idx(&self, idx: usize) -> Option<&RwLock<HashMap<u128, V>>> {
+        self.tables.get(idx)
+    }
+
+    #[allow(dead_code)]
     pub fn read(&self, key: u128) -> RwLockReadGuard<HashMap<u128, V>> {
         self.get(key).read()
     }
 
     pub fn write(&self, key: u128) -> RwLockWriteGuard<HashMap<u128, V>> {
         self.get(key).write()
+    }
+
+    #[allow(dead_code)]
+    pub fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(&u128, &V),
+    {
+        for shard in &self.tables {
+            let guard = shard.read();
+            for (key, value) in guard.iter() {
+                f(key, value);
+            }
+        }
     }
 
     // TODO: work out the lifetimes to provide get/set directly
